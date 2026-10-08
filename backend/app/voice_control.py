@@ -1,192 +1,434 @@
-"""AURA AI - Local Voice Input / Output
+"""
+AURA AI - Local Voice Control
 
-Speech-to-text:
-    faster-whisper (runs locally)
-
-Microphone:
-    Explicitly uses the user's Bluetooth Airdopes 138 microphone when available.
-
-Text-to-speech:
-    pyttsx3 / Windows SAPI
-
-This module is intentionally defensive: microphone, Whisper, and TTS
-errors are converted into useful RuntimeError messages instead of
-opaque failures.
+Features:
+- Local speech-to-text using faster-whisper
+- Local text-to-speech using Windows SAPI / pyttsx3
+- Microphone recording
+- Whisper typo normalization for common AURA commands
+- English + Hinglish command cleanup
 """
 
 from __future__ import annotations
 
-import tempfile
-import wave
-from pathlib import Path
-from typing import Any
+import difflib
+import re
+import threading
+from typing import Optional
 
 import numpy as np
+import sounddevice as sd
+from faster_whisper import WhisperModel
+import pyttsx3
 
 
 # ============================================================
-# AURA VOICE CONFIGURATION
+# CONFIGURATION
 # ============================================================
-
-# User's Bluetooth microphone:
-# "airpodes (2- Airdopes 138), MME (1 in, 0 out)"
-PREFERRED_INPUT_DEVICE_NAME = "airpodes (2- Airdopes 138)"
-
-# SoundDevice device index found on this Windows machine.
-# We still search by name first so the code survives device-index changes.
-PREFERRED_INPUT_DEVICE_INDEX = 1
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
 
-_WHISPER_MODEL = None
+# Whisper model.
+# "base" gives a good balance between speed and accuracy.
+MODEL_SIZE = "base"
+
+# Preferred Bluetooth microphone.
+PREFERRED_INPUT_DEVICE_NAME = "airpodes (2- Airdopes 138)"
+
+# Fallback device index.
+PREFERRED_INPUT_DEVICE_INDEX = 1
+
+# Recording defaults.
+DEFAULT_SECONDS = 5
+
+# Silence settings.
+SILENCE_THRESHOLD = 0.012
+SILENCE_DURATION = 0.8
+
+# Minimum audio required.
+MIN_AUDIO_SECONDS = 0.5
 
 
 # ============================================================
-# DEVICE HELPERS
+# GLOBALS
 # ============================================================
 
-def _get_input_device() -> int:
-    """Return the Airdopes 138 input device index."""
+_whisper_model: Optional[WhisperModel] = None
+_whisper_lock = threading.Lock()
 
-    try:
-        import sounddevice as sd
-    except ImportError as exc:
-        raise RuntimeError(
-            "sounddevice is not installed. Run: "
-            "python -m pip install sounddevice"
-        ) from exc
+_tts_engine = None
+_tts_lock = threading.Lock()
+
+
+# ============================================================
+# AURA VOCABULARY
+# ============================================================
+
+# Words that are very important for AURA commands.
+# Whisper can sometimes produce slightly wrong spellings.
+
+AURA_WORDS = [
+    # Apps
+    "calculator",
+    "notepad",
+    "chrome",
+    "edge",
+    "firefox",
+    "camera",
+    "paint",
+    "explorer",
+    "photos",
+    "clock",
+    "calendar",
+    "mail",
+    "settings",
+    "task manager",
+    "snipping tool",
+    "media player",
+    "visual studio code",
+    "visual studio",
+    "terminal",
+    "powershell",
+    "cmd",
+    "postman",
+    "github desktop",
+    "word",
+    "excel",
+    "powerpoint",
+    "outlook",
+    "teams",
+    "whatsapp",
+    "spotify",
+    "discord",
+    "zoom",
+    "telegram",
+    "obs studio",
+
+    # Websites
+    "github",
+    "gmail",
+    "drive",
+    "leetcode",
+    "youtube",
+    "linkedin",
+    "chatgpt",
+    "google",
+    "stackoverflow",
+    "instagram",
+
+    # Commands
+    "open",
+    "launch",
+    "start",
+    "run",
+    "visit",
+    "go to",
+    "kholo",
+    "khol",
+    "open karo",
+    "chalao",
+    "start karo",
+    "shuru karo",
+
+    # Actions
+    "screenshot",
+    "scroll",
+    "scroll up",
+    "scroll down",
+    "type",
+    "press",
+    "click",
+    "double click",
+]
+
+
+# ============================================================
+# COMMON WHISPER CORRECTIONS
+# ============================================================
+
+# Exact known mistakes are handled first.
+COMMON_CORRECTIONS = {
+    # Calculator
+    "canculator": "calculator",
+    "calculater": "calculator",
+    "calcultor": "calculator",
+    "calculater": "calculator",
+    "calculater": "calculator",
+    "calculatorr": "calculator",
+
+    # Chrome
+    "crome": "chrome",
+    "chrom": "chrome",
+    "chorme": "chrome",
+
+    # Notepad
+    "notpad": "notepad",
+    "note pad": "notepad",
+
+    # WhatsApp
+    "what's app": "whatsapp",
+    "whats app": "whatsapp",
+    "whatsapp": "whatsapp",
+
+    # GitHub
+    "git hub": "github",
+    "githab": "github",
+    "githubb": "github",
+
+    # Gmail
+    "g mail": "gmail",
+    "g-mail": "gmail",
+
+    # LinkedIn
+    "linked in": "linkedin",
+    "linkdin": "linkedin",
+    "linkden": "linkedin",
+
+    # LeetCode
+    "leet code": "leetcode",
+    "leatcode": "leetcode",
+    "leat code": "leetcode",
+
+    # YouTube
+    "you tube": "youtube",
+    "utube": "youtube",
+
+    # Calculator-related
+    "calc": "calculator",
+
+    # VS Code
+    "vs code": "visual studio code",
+    "vs-code": "visual studio code",
+}
+
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def _clean_text(text: str) -> str:
+    """Basic cleanup of Whisper output."""
+
+    text = text.strip()
+
+    # Remove repeated spaces.
+    text = re.sub(r"\s+", " ", text)
+
+    # Remove obvious trailing punctuation.
+    text = text.strip(" .,!?;:")
+
+    return text
+
+
+def _exact_correction(text: str) -> str:
+    """
+    Apply safe known corrections.
+
+    We replace complete words/phrases only.
+    """
+
+    result = text
+
+    # Longest phrases first.
+    for wrong, correct in sorted(
+        COMMON_CORRECTIONS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        pattern = rf"\b{re.escape(wrong)}\b"
+
+        result = re.sub(
+            pattern,
+            correct,
+            result,
+            flags=re.IGNORECASE,
+        )
+
+    return result
+
+
+def _fuzzy_correct_word(word: str) -> str:
+    """
+    Correct a single word only when it is very close
+    to a known AURA word.
+
+    We keep the threshold conservative so random words
+    are not changed.
+    """
+
+    clean_word = word.casefold().strip()
+
+    if not clean_word:
+        return word
+
+    # Don't touch very short words.
+    if len(clean_word) <= 3:
+        return word
+
+    # Direct correction already handled.
+    if clean_word in COMMON_CORRECTIONS:
+        return COMMON_CORRECTIONS[clean_word]
+
+    candidates = [
+        item
+        for item in AURA_WORDS
+        if " " not in item
+        and abs(len(item) - len(clean_word)) <= 3
+    ]
+
+    if not candidates:
+        return word
+
+    matches = difflib.get_close_matches(
+        clean_word,
+        candidates,
+        n=1,
+        cutoff=0.82,
+    )
+
+    if not matches:
+        return word
+
+    corrected = matches[0]
+
+    # Don't modify if it is already identical.
+    if corrected.casefold() == clean_word:
+        return word
+
+    return corrected
+
+
+def normalize_voice_command(text: str) -> str:
+    """
+    Convert Whisper's slightly incorrect transcription
+    into a cleaner AURA command.
+
+    Example:
+
+        Open Canculator
+        ↓
+        Open calculator
+    """
+
+    if not text:
+        return ""
+
+    text = _clean_text(text)
+
+    # First use known corrections.
+    text = _exact_correction(text)
+
+    # Then conservative fuzzy correction.
+    words = text.split()
+
+    corrected_words = []
+
+    for word in words:
+        corrected_words.append(
+            _fuzzy_correct_word(word)
+        )
+
+    text = " ".join(corrected_words)
+
+    # Final cleanup.
+    text = _clean_text(text)
+
+    return text
+
+
+# ============================================================
+# MICROPHONE
+# ============================================================
+
+def _find_input_device():
+    """
+    Find the preferred microphone.
+
+    Preference:
+    1. Airdopes 138
+    2. configured fallback index
+    3. system default input
+    """
 
     try:
         devices = sd.query_devices()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not read audio devices: {type(exc).__name__}: {exc}"
-        ) from exc
 
-    # 1. Prefer an exact/partial name match with an input channel.
-    preferred = PREFERRED_INPUT_DEVICE_NAME.casefold()
+        # First search by name.
+        preferred_lower = PREFERRED_INPUT_DEVICE_NAME.casefold()
 
-    for index, device in enumerate(devices):
-        name = str(device.get("name", ""))
-        max_input = int(device.get("max_input_channels", 0) or 0)
+        for index, device in enumerate(devices):
+            name = str(device.get("name", "")).casefold()
+            max_input = int(device.get("max_input_channels", 0))
 
-        if max_input > 0 and preferred in name.casefold():
-            return index
+            if max_input > 0 and preferred_lower in name:
+                return index
 
-    # 2. Fallback to the known device index only if it is still
-    #    a valid input device.
-    try:
-        device = devices[PREFERRED_INPUT_DEVICE_INDEX]
-        max_input = int(device.get("max_input_channels", 0) or 0)
+        # Fallback index.
+        if 0 <= PREFERRED_INPUT_DEVICE_INDEX < len(devices):
+            device = devices[PREFERRED_INPUT_DEVICE_INDEX]
 
-        if max_input > 0:
-            return PREFERRED_INPUT_DEVICE_INDEX
-    except (IndexError, TypeError, ValueError):
+            if int(device.get("max_input_channels", 0)) > 0:
+                return PREFERRED_INPUT_DEVICE_INDEX
+
+    except Exception:
         pass
 
-    # 3. Give a useful error instead of silently using another mic.
-    available = []
-
-    for index, device in enumerate(devices):
-        max_input = int(device.get("max_input_channels", 0) or 0)
-
-        if max_input > 0:
-            available.append(
-                f"{index}: {device.get('name', 'Unknown device')}"
-            )
-
-    available_text = "\n".join(available) or "No input microphones found."
-
-    raise RuntimeError(
-        "Airdopes 138 microphone was not found.\n\n"
-        "Available input devices:\n"
-        f"{available_text}\n\n"
-        "Make sure your Airdopes 138 is connected and try again."
-    )
+    # None = system default.
+    return None
 
 
-def get_input_device_info() -> dict[str, Any]:
-    """Return information about the microphone AURA will use."""
+def get_microphone_info() -> str:
+    """Return the microphone currently selected by AURA."""
+
+    device_index = _find_input_device()
 
     try:
-        import sounddevice as sd
-    except ImportError as exc:
-        raise RuntimeError(
-            "sounddevice is not installed. Run: "
-            "python -m pip install sounddevice"
-        ) from exc
+        devices = sd.query_devices()
 
-    device_index = _get_input_device()
-    device = sd.query_devices(device_index)
+        if device_index is None:
+            default_device = sd.default.device
 
-    return {
-        "index": device_index,
-        "name": device.get("name", "Unknown"),
-        "max_input_channels": device.get("max_input_channels", 0),
-        "sample_rate": SAMPLE_RATE,
-    }
+            if isinstance(default_device, (list, tuple)):
+                device_index = default_device[0]
 
+        if device_index is not None:
+            return str(
+                devices[int(device_index)]["name"]
+            )
 
-# ============================================================
-# WHISPER
-# ============================================================
+    except Exception:
+        pass
 
-def _get_whisper_model():
-    global _WHISPER_MODEL
-
-    if _WHISPER_MODEL is None:
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError as exc:
-            raise RuntimeError(
-                "faster-whisper is not installed. Run: "
-                "python -m pip install faster-whisper"
-            ) from exc
-
-        _WHISPER_MODEL = WhisperModel(
-            "base",
-            device="cpu",
-            compute_type="int8",
-        )
-
-    return _WHISPER_MODEL
+    return "System default microphone"
 
 
 # ============================================================
 # RECORDING
 # ============================================================
 
-def _record_wav(seconds: int) -> Path:
-    """Record audio from the explicitly selected Bluetooth microphone."""
+def _record_audio(seconds: int = DEFAULT_SECONDS) -> np.ndarray:
+    """
+    Record microphone audio.
+
+    Uses the preferred input device.
+    """
+
+    device_index = _find_input_device()
+
+    print(
+        f"[AURA Voice] Microphone: "
+        f"{get_microphone_info()}"
+    )
+
+    print("[AURA Voice] Listening...")
 
     try:
-        import sounddevice as sd
-    except ImportError as exc:
-        raise RuntimeError(
-            "sounddevice is not installed. Run: "
-            "python -m pip install sounddevice"
-        ) from exc
-
-    seconds = max(2, min(int(seconds), 10))
-    device_index = _get_input_device()
-
-    try:
-        device_info = sd.query_devices(device_index)
-        device_name = device_info.get("name", "Unknown")
-
-        print(
-            f"[AURA Voice] Microphone: {device_name} "
-            f"(device {device_index})"
-        )
-
-        # Explicitly specify the device instead of relying on Windows
-        # default input.
-        recording = sd.rec(
+        audio = sd.rec(
             int(seconds * SAMPLE_RATE),
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
-            dtype="int16",
+            dtype="float32",
             device=device_index,
         )
 
@@ -194,128 +436,259 @@ def _record_wav(seconds: int) -> Path:
 
     except Exception as exc:
         raise RuntimeError(
-            "Could not record from the Airdopes 138 microphone. "
-            f"Device index: {device_index}. "
-            f"Error: {type(exc).__name__}: {exc}"
+            f"Microphone recording failed: {exc}"
         ) from exc
 
-    temp = tempfile.NamedTemporaryFile(
-        suffix=".wav",
-        delete=False,
-    )
-    temp.close()
-
-    path = Path(temp.name)
-
-    try:
-        with wave.open(str(path), "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(
-                np.asarray(recording, dtype=np.int16).tobytes()
-            )
-    except Exception:
-        path.unlink(missing_ok=True)
-        raise
-
-    return path
+    return audio.reshape(-1)
 
 
 # ============================================================
-# SPEECH TO TEXT
+# WHISPER
+# ============================================================
+
+def _get_whisper_model() -> WhisperModel:
+    """Load Whisper only once."""
+
+    global _whisper_model
+
+    if _whisper_model is not None:
+        return _whisper_model
+
+    with _whisper_lock:
+
+        if _whisper_model is None:
+
+            print(
+                "[AURA Voice] Loading Whisper model..."
+            )
+
+            _whisper_model = WhisperModel(
+                MODEL_SIZE,
+                device="cpu",
+                compute_type="int8",
+            )
+
+            print(
+                "[AURA Voice] Whisper model ready."
+            )
+
+    return _whisper_model
+
+
+def _transcribe_audio(audio: np.ndarray) -> tuple[str, str]:
+    """Transcribe audio locally."""
+
+    model = _get_whisper_model()
+
+    print("[AURA Voice] Transcribing...")
+
+    segments, info = model.transcribe(
+        audio,
+        language="en",
+        beam_size=5,
+        best_of=3,
+        temperature=0.0,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        compression_ratio_threshold=2.4,
+        log_prob_threshold=-1.0,
+    )
+
+    text_parts = []
+
+    for segment in segments:
+        text = segment.text.strip()
+
+        if text:
+            text_parts.append(text)
+
+    raw_text = " ".join(text_parts).strip()
+
+    language = getattr(
+        info,
+        "language",
+        "en",
+    ) or "en"
+
+    return raw_text, language
+
+
+# ============================================================
+# MAIN LISTEN FUNCTION
 # ============================================================
 
 def listen_and_transcribe(
-    seconds: int = 5,
-    language: str = "auto",
-) -> dict[str, Any]:
-    """Record from Airdopes 138 and transcribe locally with Whisper."""
+    seconds: int = DEFAULT_SECONDS,
+    language: str = "en",
+) -> dict:
+    """
+    Record -> Whisper -> normalize.
 
-    seconds = max(2, min(int(seconds), 10))
+    Returns:
 
-    wav_path = _record_wav(seconds)
+    {
+        "text": "open calculator",
+        "raw_text": "Open Canculator",
+        "language": "en"
+    }
+    """
 
-    try:
-        model = _get_whisper_model()
+    audio = _record_audio(seconds)
 
-        language_text = str(language or "auto").casefold()
-        language_arg = (
-            None
-            if language_text in {"auto", ""}
-            else language_text
-        )
-
-        print("[AURA Voice] Transcribing...")
-
-        segments, info = model.transcribe(
-            str(wav_path),
-            language=language_arg,
-            vad_filter=True,
-            beam_size=5,
-        )
-
-        text = " ".join(
-            segment.text.strip()
-            for segment in segments
-            if segment.text.strip()
-        ).strip()
-
-        detected_language = getattr(
-            info,
-            "language",
-            language_arg or "unknown",
-        )
-
-        print(f"[AURA Voice] Heard: {text!r}")
-        print(f"[AURA Voice] Language: {detected_language}")
-
+    # Check if audio contains enough signal.
+    if audio.size == 0:
         return {
-            "text": text,
-            "language": detected_language,
-            "device": get_input_device_info(),
+            "text": "",
+            "raw_text": "",
+            "language": language,
         }
 
-    finally:
-        try:
-            wav_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+    duration = len(audio) / SAMPLE_RATE
+
+    if duration < MIN_AUDIO_SECONDS:
+        return {
+            "text": "",
+            "raw_text": "",
+            "language": language,
+        }
+
+    # Check audio level.
+    rms = float(
+        np.sqrt(
+            np.mean(
+                np.square(audio)
+            )
+        )
+    )
+
+    print(
+        f"[AURA Voice] Audio level: {rms:.4f}"
+    )
+
+    if rms < SILENCE_THRESHOLD:
+        print(
+            "[AURA Voice] No clear speech detected."
+        )
+
+        return {
+            "text": "",
+            "raw_text": "",
+            "language": language,
+        }
+
+    raw_text, detected_language = _transcribe_audio(
+        audio
+    )
+
+    if not raw_text:
+        return {
+            "text": "",
+            "raw_text": "",
+            "language": detected_language,
+        }
+
+    normalized_text = normalize_voice_command(
+        raw_text
+    )
+
+    print(
+        f"[AURA Voice] Heard: '{raw_text}'"
+    )
+
+    if normalized_text.casefold() != raw_text.casefold():
+        print(
+            f"[AURA Voice] Corrected: "
+            f"'{normalized_text}'"
+        )
+
+    return {
+        "text": normalized_text,
+        "raw_text": raw_text,
+        "language": detected_language,
+    }
 
 
 # ============================================================
 # TEXT TO SPEECH
 # ============================================================
 
-def speak_text(text: str) -> None:
-    """Speak through Windows SAPI.
+def _get_tts_engine():
+    global _tts_engine
 
-    TTS is output-side; it does not affect the selected Bluetooth
-    microphone used for voice input.
-    """
+    if _tts_engine is not None:
+        return _tts_engine
 
-    try:
-        import pyttsx3
-    except ImportError as exc:
-        raise RuntimeError(
-            "pyttsx3 is not installed. Run: "
-            "python -m pip install pyttsx3"
-        ) from exc
+    with _tts_lock:
 
-    engine = None
+        if _tts_engine is None:
 
-    try:
-        engine = pyttsx3.init()
-        engine.setProperty("rate", 175)
-        engine.say(str(text))
-        engine.runAndWait()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Text-to-speech failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    finally:
-        if engine is not None:
             try:
-                engine.stop()
-            except Exception:
-                pass
+                engine = pyttsx3.init()
+
+                # Slightly natural speaking speed.
+                engine.setProperty(
+                    "rate",
+                    175,
+                )
+
+                engine.setProperty(
+                    "volume",
+                    1.0,
+                )
+
+                _tts_engine = engine
+
+            except Exception as exc:
+                raise RuntimeError(
+                    f"TTS initialization failed: {exc}"
+                ) from exc
+
+    return _tts_engine
+
+
+def speak_text(text: str) -> None:
+    """Speak text using Windows local TTS."""
+
+    if not text:
+        return
+
+    try:
+        engine = _get_tts_engine()
+
+        with _tts_lock:
+            engine.say(str(text))
+            engine.runAndWait()
+
+    except Exception as exc:
+        print(
+            f"[AURA Voice] TTS error: {exc}"
+        )
+
+
+# ============================================================
+# TEST
+# ============================================================
+
+if __name__ == "__main__":
+
+    print("=" * 60)
+    print("AURA VOICE TEST")
+    print("=" * 60)
+
+    print(
+        "Microphone:",
+        get_microphone_info(),
+    )
+
+    result = listen_and_transcribe()
+
+    print()
+    print("Raw:", result["raw_text"])
+    print("Final:", result["text"])
+    print()
+
+    if result["text"]:
+        speak_text(
+            f"I heard {result['text']}"
+        )

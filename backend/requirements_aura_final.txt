@@ -1,0 +1,13 @@
+python-docx>=1.1.0
+google-api-python-client>=2.180.0
+google-auth-httplib2>=0.2.0
+google-auth-oauthlib>=1.2.2
+requests>=2.31.0
+numpy>=1.26.0
+sounddevice>=0.5.0
+faster-whisper>=1.1.0
+pyttsx3>=2.90
+keyboard>=0.13.5
+pyautogui>=0.9.54
+pillow>=10.0.0
+pygetwindow>=0.0.9

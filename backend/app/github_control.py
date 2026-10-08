@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import json
 import webbrowser
 from pathlib import Path
 from typing import Any
@@ -231,6 +232,236 @@ def git_push(path: str) -> dict[str, Any]:
         raise GitHubActionError(stderr or stdout or "git push failed.")
     return {"branch": branch, "output": stdout or stderr, "message": "Code pushed successfully."}
 
+
+
+def _gh_json(command: list[str], timeout: int = 60) -> Any:
+    code, stdout, stderr = _run(command, timeout=timeout)
+    if code != 0:
+        raise GitHubActionError(stderr or stdout or "GitHub CLI command failed.")
+    if not stdout:
+        return []
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise GitHubActionError("GitHub CLI returned invalid JSON.") from exc
+
+
+def _owner_repo(target: str, account: str | None = None) -> str:
+    value = target.strip().strip('"\'')
+    if "/" in value:
+        return value
+    if not account:
+        raise GitHubActionError("Use owner/repository or authenticate so I can determine the GitHub account.")
+    return f"{account}/{value}"
+
+
+def github_list_repos(limit: int = 100) -> list[dict[str, Any]]:
+    auth = github_auth_status()
+    account = auth.get("account")
+    if not account:
+        raise GitHubActionError("Could not determine the authenticated GitHub account.")
+    limit = max(1, min(int(limit), 1000))
+    data = _gh_json([
+        "gh", "repo", "list", account,
+        "--limit", str(limit),
+        "--json", "name,visibility,url,description,stargazerCount,forkCount,isArchived,updatedAt",
+    ])
+    return [
+        {
+            "name": item.get("name"),
+            "visibility": str(item.get("visibility", "")).lower(),
+            "url": item.get("url"),
+            "description": item.get("description"),
+            "stars": item.get("stargazerCount", 0),
+            "forks": item.get("forkCount", 0),
+            "archived": item.get("isArchived", False),
+            "updated_at": item.get("updatedAt"),
+        }
+        for item in data
+        if isinstance(item, dict)
+    ]
+
+
+def github_repo_info(target: str, account: str | None = None) -> dict[str, Any]:
+    full_name = _owner_repo(target, account)
+    data = _gh_json([
+        "gh", "repo", "view", full_name,
+        "--json", "name,nameWithOwner,owner,visibility,url,description,defaultBranchRef,stargazerCount,forkCount,issues,updatedAt",
+    ])
+    if not isinstance(data, dict):
+        raise GitHubActionError("Unexpected repository information from GitHub.")
+    owner = data.get("owner")
+    if isinstance(owner, dict):
+        owner = owner.get("login")
+    default_ref = data.get("defaultBranchRef")
+    if isinstance(default_ref, dict):
+        default_branch = default_ref.get("name")
+    else:
+        default_branch = default_ref
+    issues = data.get("issues")
+    open_issues = issues.get("totalCount") if isinstance(issues, dict) else None
+    return {
+        "name": data.get("nameWithOwner") or full_name,
+        "owner": owner,
+        "visibility": str(data.get("visibility", "")).lower(),
+        "url": data.get("url"),
+        "description": data.get("description"),
+        "default_branch": default_branch or "unknown",
+        "stars": data.get("stargazerCount", 0),
+        "forks": data.get("forkCount", 0),
+        "open_issues": open_issues if open_issues is not None else 0,
+        "updated_at": data.get("updatedAt"),
+    }
+
+
+def github_list_issues(target: str, account: str | None = None, limit: int = 30) -> list[dict[str, Any]]:
+    full_name = _owner_repo(target, account)
+    limit = max(1, min(int(limit), 100))
+    data = _gh_json([
+        "gh", "issue", "list", "--repo", full_name,
+        "--state", "open", "--limit", str(limit),
+        "--json", "number,title,author,url,labels,updatedAt",
+    ])
+    result = []
+    for item in data:
+        author = item.get("author")
+        if isinstance(author, dict):
+            author = author.get("login")
+        result.append({
+            "number": item.get("number"),
+            "title": item.get("title"),
+            "author": author or "unknown",
+            "url": item.get("url"),
+            "labels": [x.get("name") for x in (item.get("labels") or []) if isinstance(x, dict)],
+            "updated_at": item.get("updatedAt"),
+        })
+    return result
+
+
+def github_list_prs(target: str, account: str | None = None, limit: int = 30) -> list[dict[str, Any]]:
+    full_name = _owner_repo(target, account)
+    limit = max(1, min(int(limit), 100))
+    data = _gh_json([
+        "gh", "pr", "list", "--repo", full_name,
+        "--state", "open", "--limit", str(limit),
+        "--json", "number,title,author,url,headRefName,baseRefName,updatedAt",
+    ])
+    result = []
+    for item in data:
+        author = item.get("author")
+        if isinstance(author, dict):
+            author = author.get("login")
+        result.append({
+            "number": item.get("number"),
+            "title": item.get("title"),
+            "author": author or "unknown",
+            "url": item.get("url"),
+            "head": item.get("headRefName"),
+            "base": item.get("baseRefName"),
+            "updated_at": item.get("updatedAt"),
+        })
+    return result
+
+
+def github_list_runs(target: str, account: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    full_name = _owner_repo(target, account)
+    limit = max(1, min(int(limit), 100))
+    data = _gh_json([
+        "gh", "run", "list", "--repo", full_name,
+        "--limit", str(limit),
+        "--json", "name,status,conclusion,headBranch,url,workflowName,createdAt",
+    ])
+    result = []
+    for item in data:
+        workflow = item.get("workflowName") or item.get("name") or "workflow"
+        result.append({
+            "workflow": workflow,
+            "status": item.get("status") or "unknown",
+            "conclusion": item.get("conclusion") or "pending",
+            "branch": item.get("headBranch") or "unknown",
+            "url": item.get("url"),
+            "created_at": item.get("createdAt"),
+        })
+    return result
+
+
+def github_list_commits(target: str, account: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    full_name = _owner_repo(target, account)
+    limit = max(1, min(int(limit), 100))
+    raw = _gh_json([
+        "gh", "api", f"repos/{full_name}/commits", "-f", f"per_page={limit}"
+    ])
+    result = []
+    for item in raw:
+        commit = item.get("commit") or {}
+        author = commit.get("author") or {}
+        message = (commit.get("message") or "").splitlines()[0]
+        result.append({
+            "sha": str(item.get("sha", ""))[:7],
+            "message": message,
+            "author": author.get("name") or "unknown",
+            "url": item.get("html_url"),
+            "date": author.get("date"),
+        })
+    return result
+
+
+def github_search_repos(query: str, limit: int = 20) -> list[dict[str, Any]]:
+    query = query.strip()
+    if not query:
+        raise GitHubActionError("GitHub search query cannot be empty.")
+    limit = max(1, min(int(limit), 100))
+    data = _gh_json([
+        "gh", "search", "repos", query,
+        "--limit", str(limit),
+        "--json", "name,owner,visibility,url,description,stargazersCount,forksCount",
+    ])
+    result = []
+    for item in data:
+        owner = item.get("owner")
+        if isinstance(owner, dict):
+            owner = owner.get("login")
+        result.append({
+            "name": f"{owner}/{item.get('name')}" if owner else item.get("name"),
+            "visibility": str(item.get("visibility", "")).lower(),
+            "url": item.get("url"),
+            "description": item.get("description"),
+            "stars": item.get("stargazersCount", 0),
+            "forks": item.get("forksCount", 0),
+        })
+    return result
+
+
+def github_create_repo_action(repo_name: str, visibility: str = "private") -> dict[str, Any]:
+    repo_name = normalize_repo_name(repo_name)
+    visibility = visibility.casefold()
+    if visibility not in {"private", "public"}:
+        raise GitHubActionError("Visibility must be private or public.")
+    auth = github_auth_status()
+    account = auth.get("account")
+    if not account:
+        raise GitHubActionError("Could not determine the authenticated GitHub account.")
+    flag = "--private" if visibility == "private" else "--public"
+    code, stdout, stderr = _run(["gh", "repo", "create", f"{account}/{repo_name}", flag], timeout=120)
+    if code != 0:
+        raise GitHubActionError(stderr or stdout or "GitHub repository creation failed.")
+    return {"name": f"{account}/{repo_name}", "visibility": visibility, "url": f"https://github.com/{account}/{repo_name}"}
+
+
+def github_clone_repo(target: str, destination: str | None = None, account: str | None = None) -> dict[str, Any]:
+    full_name = _owner_repo(target, account)
+    command = ["gh", "repo", "clone", full_name]
+    if destination:
+        destination = os.path.expandvars(destination.strip().strip('"\''))
+        command.append(destination)
+    code, stdout, stderr = _run(command, timeout=300)
+    if code != 0:
+        raise GitHubActionError(stderr or stdout or "GitHub repository clone failed.")
+    if destination:
+        path = str(Path(destination).expanduser().resolve())
+    else:
+        path = str(Path(full_name.split("/", 1)[-1]).resolve())
+    return {"repository": full_name, "path": path, "output": stdout or stderr}
 
 def get_repo_web_url(path: str) -> str | None:
     remote = get_remote(path)
