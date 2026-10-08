@@ -1,0 +1,87 @@
+AURA AI - LAPTOP CONTROL PHASE 1
+================================
+
+IMPORTANT
+- This is Phase 1: explicit text commands for basic Windows desktop actions.
+- It does not yet visually understand arbitrary screen contents. Local voice commands are supported.
+- It does not run arbitrary shell commands.
+- Typing text only types it into the currently focused window; it does not auto-send/submit.
+- Mouse fail-safe is enabled: move the mouse to the top-left corner to trigger PyAutoGUI's fail-safe.
+
+1) BACK UP YOUR EXISTING FILE
+Open your project folder:
+C:\Users\sajal\OneDrive\Desktop\Aura AI\backend\app
+Copy main.py to main_backup.py before replacing it.
+
+2) COPY THE TWO FILES
+Copy main.py and laptop_control.py from this bundle's app folder into:
+C:\Users\sajal\OneDrive\Desktop\Aura AI\backend\app
+Keep both files together in that app folder.
+
+3) INSTALL DEPENDENCIES
+Open PowerShell in:
+C:\Users\sajal\OneDrive\Desktop\Aura AI\backend
+Activate your existing virtual environment if needed, then run:
+.venv\Scripts\Activate.ps1
+python -m pip install pyautogui pillow
+
+If PowerShell says scripts are disabled, run the existing venv Python directly:
+.venv\Scripts\python.exe -m pip install pyautogui pillow
+
+4) START AURA
+From the backend folder run:
+python -m uvicorn app.main:app --reload --port 8000
+
+Open API docs:
+http://127.0.0.1:8000/docs
+
+5) TEST THROUGH POST /agent
+Use POST /agent with JSON body:
+{"message":"open Notepad"}
+{"message":"open Chrome"}
+{"message":"take screenshot"}
+{"message":"scroll down"}
+{"message":"press Ctrl+S"}
+{"message":"type: Hello from AURA"}
+{"message":"click at 500, 300"}
+
+NOTE: click coordinates depend on your actual screen. First check GET /tools/laptop/status for screen dimensions.
+
+6) DIRECT TOOL ENDPOINT
+POST /tools/laptop/action examples:
+{"action":"open_app","app":"notepad"}
+{"action":"screenshot"}
+{"action":"hotkey","key":"ctrl+s"}
+{"action":"click","x":500,"y":300}
+{"action":"type_text","text":"Hello"}
+{"action":"scroll","direction":"down","amount":3}
+
+Screenshots are saved to:
+%USERPROFILE%\Pictures\AURA_Screenshots
+
+7) VOICE COMMANDS
+Install the voice dependencies from the backend folder:
+.venv\Scripts\python.exe -m pip install -r requirements-voice.txt
+
+Keep PyAV below version 19: the installed Faster-Whisper audio decoder passes an
+argument that PyAV 19 no longer accepts.
+
+Run the API locally as described above, then open another PowerShell in the backend
+folder and run:
+.venv\Scripts\python.exe voice_assistant.py
+
+Choose the microphone number shown at startup (or press ENTER to use Windows default),
+then press ENTER each time you want to search or issue a command. Speak within 8 seconds;
+the loop lets you make repeated requests until you stop it with Ctrl+C. Voice is
+transcribed locally by faster-whisper using automatic language detection, so English,
+Hindi, and Hinglish can be attempted. The API and voice_assistant.py must run on the
+same computer because the API records from that computer's selected microphone. If
+recognition is empty, check the printed audio level and Windows microphone privacy
+permission.
+
+SAFETY
+- Only allowlisted apps can be launched. Current aliases: Chrome, browser, Edge, Notepad,
+  Calculator, Paint, Explorer, and VS Code.
+- Review typed text before sending it. Avoid using automation to submit forms or send messages
+  until a confirmation layer is implemented.
+- Do not store passwords or API tokens in chat or source code.

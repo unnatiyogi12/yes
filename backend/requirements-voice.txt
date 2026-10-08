@@ -1,0 +1,5 @@
+faster-whisper
+sounddevice
+pyttsx3
+numpy
+av>=11,<19
